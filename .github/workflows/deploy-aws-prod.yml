@@ -89,11 +89,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd target
-          cp "$(basename "${JAR_PATH}")" app.jar
-          zip -q function.zip app.jar
-          mv function.zip ../
-          cd ..
+          # JAR_PATH já foi salvo no GITHUB_ENV no passo anterior
+          if [ -z "${JAR_PATH:-}" ] || [ ! -f "${JAR_PATH}" ]; then
+            echo "ERRO: JAR_PATH não encontrado: '${JAR_PATH:-}'"; exit 1
+          fi
+          # -j remove o path; o nome do arquivo dentro do zip não precisa ser "app.jar"
+          zip -q -j function.zip "${JAR_PATH}"
           ls -lh function.zip
 
       - name: Deploy to Lambda (runtime java21 + handler)
