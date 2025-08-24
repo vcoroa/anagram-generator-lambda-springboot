@@ -97,7 +97,7 @@ jobs:
           zip -q -j function.zip "${JAR_PATH}"
           ls -lh function.zip
 
-      - name: Deploy to Lambda (runtime java21 + handler) — com waits
+      - name: Deploy to Lambda (runtime java21 + handler) — com waits (JAR direto)
         shell: bash
         run: |
           set -euo pipefail
@@ -105,6 +105,7 @@ jobs:
           FN="${{ env.FUNCTION_NAME }}"
           HANDLER="${{ env.LAMBDA_HANDLER }}"
           ROLE_ARN="${{ env.ROLE_ARN }}"
+          JAR="${JAR_PATH:-target/app.jar}"
 
           if ! aws lambda get-function --function-name "$FN" &> /dev/null; then
             echo "Criando nova função Lambda..."
@@ -113,7 +114,7 @@ jobs:
               --runtime java21 \
               --role "$ROLE_ARN" \
               --handler "$HANDLER" \
-              --zip-file "fileb://function.zip" \
+              --zip-file "fileb://${JAR}" \
               --timeout 30 \
               --memory-size 512
 
@@ -131,10 +132,10 @@ jobs:
             echo "Aguardando conclusão do update de CONFIG..."
             aws lambda wait function-updated --function-name "$FN"
 
-            echo "Atualizando CÓDIGO da função..."
+            echo "Atualizando CÓDIGO da função (subindo JAR diretamente)..."
             aws lambda update-function-code \
               --function-name "$FN" \
-              --zip-file "fileb://function.zip" >/dev/null
+              --zip-file "fileb://${JAR}" >/dev/null
 
             echo "Aguardando conclusão do update de CÓDIGO..."
             aws lambda wait function-updated --function-name "$FN"
