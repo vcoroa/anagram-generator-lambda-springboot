@@ -1,0 +1,246 @@
+name: Deploy Spring Boot Lambda
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  AWS_REGION: sa-east-1
+  FUNCTION_NAME: anagram-generator-lambda-spring
+  ROLE_NAME: lambda-anagrama-execution-role
+  LAMBDA_HANDLER: br.com.vaniltoncoroa.greetings.config.StreamLambdaHandler
+  API_NAME: projects-backend-java-springboot-prod-gtw
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Config AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create or Update Lambda Role
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Verificando se role existe..."
+          if aws iam get-role --role-name "${{ env.ROLE_NAME }}" &> /dev/null; then
+            echo "Role já existe: ${{ env.ROLE_NAME }}"
+          else
+            echo "Criando novo role..."
+            aws iam create-role \
+              --role-name "${{ env.ROLE_NAME }}" \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": {"Service": "lambda.amazonaws.com"},
+                  "Action": "sts:AssumeRole"
+                }]
+              }'
+            echo "Anexando policy básica..."
+            aws iam attach-role-policy \
+              --role-name "${{ env.ROLE_NAME }}" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            echo "Aguardando role ficar disponível..."
+            sleep 10
+          fi
+
+          ROLE_ARN=$(aws iam get-role \
+            --role-name "${{ env.ROLE_NAME }}" \
+            --query 'Role.Arn' \
+            --output text)
+          echo "ROLE_ARN=$ROLE_ARN" >> "$GITHUB_ENV"
+
+      - name: Set up Temurin JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build (fat JAR com shade)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./mvnw
+          ./mvnw -q -DskipTests clean package
+          echo "Procurando fat JAR (shaded/uber/app.jar)..."
+          JAR_PATH=$(ls -1 target/*.jar 2>/dev/null | grep -E '(app\.jar|shaded|uber)' || true)
+          if [ -z "${JAR_PATH:-}" ]; then
+            JAR_PATH=$(ls -S target/*.jar | head -n1)
+          fi
+          echo "JAR_PATH=$JAR_PATH"
+          if [ ! -f "$JAR_PATH" ]; then
+            echo "ERRO: JAR não encontrado em target/"; exit 1
+          fi
+          echo "JAR_PATH=$JAR_PATH" >> "$GITHUB_ENV"
+
+      - name: Create deployment package (ZIP)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target
+          cp "$(basename "${JAR_PATH}")" app.jar
+          zip -q function.zip app.jar
+          mv function.zip ../
+          cd ..
+          ls -lh function.zip
+
+      - name: Deploy to Lambda (runtime java21 + handler)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! aws lambda get-function --function-name "${{ env.FUNCTION_NAME }}" &> /dev/null; then
+            echo "Criando nova função Lambda..."
+            aws lambda create-function \
+              --function-name "${{ env.FUNCTION_NAME }}" \
+              --runtime java21 \
+              --role "${{ env.ROLE_ARN }}" \
+              --handler "${{ env.LAMBDA_HANDLER }}" \
+              --zip-file "fileb://function.zip" \
+              --timeout 30 \
+              --memory-size 512
+          else
+            echo "Atualizando código da função Lambda..."
+            aws lambda update-function-code \
+              --function-name "${{ env.FUNCTION_NAME }}" \
+              --zip-file "fileb://function.zip" >/dev/null
+            echo "Garantindo runtime/handler/mem/timeout..."
+            aws lambda update-function-configuration \
+              --function-name "${{ env.FUNCTION_NAME }}" \
+              --runtime java21 \
+              --handler "${{ env.LAMBDA_HANDLER }}" \
+              --timeout 30 \
+              --memory-size 512 >/dev/null
+          fi
+
+      - name: Create API Gateway (REST proxy) - separado e nome fixo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "AWS Account ID: $AWS_ACCOUNT_ID"
+
+          LAMBDA_ARN="$(aws lambda get-function \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --query 'Configuration.FunctionArn' --output text)"
+          echo "Lambda ARN: $LAMBDA_ARN"
+
+          API_NAME="${{ env.API_NAME }}"
+
+          echo "Verificando API REST '${API_NAME}'..."
+          API_ID="$(aws apigateway get-rest-apis \
+            --query "items[?name=='${API_NAME}'].id" \
+            --output text)"
+
+          if [ -z "${API_ID:-}" ] || [ "${API_ID}" = "None" ]; then
+            echo "Criando API REST '${API_NAME}'..."
+            API_ID="$(aws apigateway create-rest-api \
+              --name "${API_NAME}" \
+              --endpoint-configuration types=REGIONAL \
+              --query 'id' --output text)"
+          fi
+          echo "API_ID=${API_ID}" | tee -a "$GITHUB_ENV"
+
+          ROOT_ID="$(aws apigateway get-resources --rest-api-id "$API_ID" \
+            --query 'items[?path==`/`].id' --output text)"
+          echo "ROOT_ID=${ROOT_ID}"
+
+          PROXY_ID="$(aws apigateway get-resources --rest-api-id "$API_ID" \
+            --query "items[?pathPart=='{proxy+}'].id" --output text)"
+          if [ -z "${PROXY_ID:-}" ] || [ "${PROXY_ID}" = "None" ]; then
+            echo "Criando resource {proxy+}..."
+            PROXY_ID="$(aws apigateway create-resource \
+              --rest-api-id "$API_ID" \
+              --parent-id "$ROOT_ID" \
+              --path-part "{proxy+}" \
+              --query 'id' --output text)"
+          fi
+          echo "PROXY_ID=${PROXY_ID}"
+
+          # Método ANY no root e no {proxy+}
+          for RID in "$ROOT_ID" "$PROXY_ID"; do
+            echo "Configurando método ANY no resource $RID..."
+            aws apigateway put-method \
+              --rest-api-id "$API_ID" \
+              --resource-id "$RID" \
+              --http-method ANY \
+              --authorization-type NONE || true
+
+            INTEGRATION_URI="arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations"
+            echo "Integration URI: $INTEGRATION_URI"
+
+            aws apigateway put-integration \
+              --rest-api-id "$API_ID" \
+              --resource-id "$RID" \
+              --http-method ANY \
+              --type AWS_PROXY \
+              --integration-http-method POST \
+              --uri "$INTEGRATION_URI"
+          done
+
+          # Permissão p/ TODOS os stages (inclui test-invoke-stage)
+          echo "Concedendo permissão p/ todos os stages..."
+          aws lambda add-permission \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --statement-id "apigw-invoke-all-${API_ID}-$(date +%s)" \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/*" || true
+
+          # Deploy stage 'prod'
+          echo "Fazendo deployment do stage 'prod'..."
+          aws apigateway create-deployment \
+            --rest-api-id "$API_ID" \
+            --stage-name "prod"
+
+          API_URL="https://${API_ID}.execute-api.${{ env.AWS_REGION }}.amazonaws.com/prod"
+          echo "API Gateway (SPRING) URL: $API_URL"
+          echo "Teste: $API_URL/hello?name=Vanilton"
+
+      - name: Smoke test - invoke Lambda directly (API Gateway proxy event)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > event.json <<'EOF'
+          {
+            "resource": "/{proxy+}",
+            "path": "/hello",
+            "httpMethod": "GET",
+            "headers": {},
+            "queryStringParameters": {"name": "Vanilton"},
+            "pathParameters": {"proxy": "hello"},
+            "stageVariables": null,
+            "requestContext": {"stage": "prod"},
+            "body": null,
+            "isBase64Encoded": false
+          }
+          EOF
+
+          echo "Invocando Lambda diretamente..."
+          aws lambda invoke \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --payload fileb://event.json \
+            out.json >/dev/null
+
+          echo "Resposta da Lambda:"
+          cat out.json
+          echo
+
+      - name: Remove Function URL (não precisamos mais)
+        shell: bash
+        run: |
+          echo "Removendo Function URL (se existir)..."
+          aws lambda delete-function-url-config \
+            --function-name ${{ env.FUNCTION_NAME }} || true
