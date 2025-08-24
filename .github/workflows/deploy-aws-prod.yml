@@ -97,32 +97,47 @@ jobs:
           zip -q -j function.zip "${JAR_PATH}"
           ls -lh function.zip
 
-      - name: Deploy to Lambda (runtime java21 + handler)
+      - name: Deploy to Lambda (runtime java21 + handler) — com waits
         shell: bash
         run: |
           set -euo pipefail
-          if ! aws lambda get-function --function-name "${{ env.FUNCTION_NAME }}" &> /dev/null; then
+
+          FN="${{ env.FUNCTION_NAME }}"
+          HANDLER="${{ env.LAMBDA_HANDLER }}"
+          ROLE_ARN="${{ env.ROLE_ARN }}"
+
+          if ! aws lambda get-function --function-name "$FN" &> /dev/null; then
             echo "Criando nova função Lambda..."
             aws lambda create-function \
-              --function-name "${{ env.FUNCTION_NAME }}" \
+              --function-name "$FN" \
               --runtime java21 \
-              --role "${{ env.ROLE_ARN }}" \
-              --handler "${{ env.LAMBDA_HANDLER }}" \
+              --role "$ROLE_ARN" \
+              --handler "$HANDLER" \
               --zip-file "fileb://function.zip" \
               --timeout 30 \
               --memory-size 512
+
+            echo "Aguardando função ficar ACTIVE..."
+            aws lambda wait function-active --function-name "$FN"
           else
-            echo "Atualizando código da função Lambda..."
-            aws lambda update-function-code \
-              --function-name "${{ env.FUNCTION_NAME }}" \
-              --zip-file "fileb://function.zip" >/dev/null
-            echo "Garantindo runtime/handler/mem/timeout..."
+            echo "Atualizando CONFIG da função (se necessário)..."
             aws lambda update-function-configuration \
-              --function-name "${{ env.FUNCTION_NAME }}" \
+              --function-name "$FN" \
               --runtime java21 \
-              --handler "${{ env.LAMBDA_HANDLER }}" \
+              --handler "$HANDLER" \
               --timeout 30 \
               --memory-size 512 >/dev/null
+
+            echo "Aguardando conclusão do update de CONFIG..."
+            aws lambda wait function-updated --function-name "$FN"
+
+            echo "Atualizando CÓDIGO da função..."
+            aws lambda update-function-code \
+              --function-name "$FN" \
+              --zip-file "fileb://function.zip" >/dev/null
+
+            echo "Aguardando conclusão do update de CÓDIGO..."
+            aws lambda wait function-updated --function-name "$FN"
           fi
 
       - name: Create API Gateway (REST proxy) - separado e nome fixo
